@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "task-message-bus": {
+      "command": "python",
+      "args": [
+        "__PLUGIN_DIR__/scripts/mcp_server.py"
+      ]
+    }
+  }
+}

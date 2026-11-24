@@ -1,0 +1,33 @@
+{
+  "task-message-bus-delivery": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python scripts/hook_handler.py",
+        "timeout": 10
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python scripts/hook_handler.py",
+        "timeout": 10
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "python scripts/hook_handler.py",
+        "timeout": 10
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python scripts/hook_handler.py",
+        "timeout": 10
+      }
+    ]
+  }
+}

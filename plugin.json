@@ -1,0 +1,12 @@
+{
+  "name": "task-message-bus",
+  "displayName": "Task Message Bus",
+  "version": "1.0.0",
+  "description": "Hook-driven message bus for proactive cross-task messaging between independent Antigravity sessions, with automatic registration, point-to-point/channel/broadcast delivery, and active CLI/App wake-up.",
+  "repository": "https://github.com/czhovo/antigravity-task-message-bus",
+  "suggestedPrompts": [
+    "列出当前已知的独立任务并把当前任务注册为别名 coordinator",
+    "向别名为 worker 的独立任务主动投递一条协作消息",
+    "查看最近跨任务消息的投递历史与唤醒状态"
+  ]
+}
