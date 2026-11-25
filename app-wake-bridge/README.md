@@ -16,6 +16,10 @@
 ~/.gemini/antigravity/task_bus/app_wake_results/<wakeId>.json
 ```
 
+本目录提供完整的脱敏参考实现：
+- [`main-ipc.js`](./main-ipc.js)：Electron 主进程 IPC 认领与回写模块（`ag-task-bus:claim-wake` / `ag-task-bus:finish-wake`）。
+- [`renderer-bridge.js`](./renderer-bridge.js)：渲染进程唤醒消费器（支持后台隐藏 pane 静默提交优先与降级瞬切）。
+
 ## 队列文件格式
 
 ### 请求（`app_wake_queue/<wakeId>.json`）
@@ -40,23 +44,25 @@
   "wakeId": "1795520885294_288e371e",
   "finishedAt": "2026-11-24T11:48:45.979Z",
   "ok": true,
-  "reason": "submitted_via_app_ui",
+  "silentNoSwitch": true,
+  "draftPreserved": false,
+  "reason": "submitted_via_hidden_pane",
   "targetConversationId": "<target-uuid>",
   "prevConversationId": "<prev-uuid>",
   "returnedToPrev": true
 }
 ```
 
-## 桥接实现要点
+## 核心设计要点
 
-如果你维护了本地 Antigravity Electron 前端扩展（如 preload + ipcMain 注入），可以按以下方式接入：
-
-1. **主进程 IPC**：
-   - `ag-task-bus:claim-wake`：原子认领 `app_wake_queue/` 中最早的未过期 `.json` 文件，通过内存 `inFlight` Map 避免多窗口重复认领，超时自动释放。
-   - `ag-task-bus:finish-wake`：接收渲染进程执行结果；若返回 `retryLater: true`（例如检测到用户输入框有未发送草稿），延后几秒重试（最多 3 次）；否则写入 `app_wake_results/<wakeId>.json` 并删除队列文件。
-2. **渲染进程消费器**：
-   - 冷启动等待侧边栏会话列表渲染就绪后再开始轮询。
-   - 保护用户草稿：若当前窗口或目标会话输入框内存在未发送文本，直接延迟重试，绝不覆盖用户输入。
-   - 切入目标会话后二次校验当前会话 ID，再向原生输入框提交 `wakeText`（提交时对 `execCommand('insertText')` 后等待 `80ms` 再判空，避免 Lexical 富文本编辑器重复插入）。
-   - 提交确认后自动切回原会话。
-   - 全程不触碰目标会话的模型选择、推理强度与审核设置，100% 沿用其原有配置；提交触发新一轮执行后，目标会话的 `PreInvocation` 钩子自动把完整 `[task-message-bus]` 消息注入上下文。
+1. **主进程原子认领与长草稿退避（`main-ipc.js`）**：
+   - 内存 `inFlight` Map 防止多窗口重复消费同一条唤醒任务（25 秒超时自动释放）。
+   - 对 `*has_draft*` 类临时退避，在队列 10 分钟 TTL 内允许最多 120 次 × 5 秒重试，避免因短暂草稿阻挡导致唤醒任务提前丢弃。
+2. **后台隐藏 DOM pane 静默提交优先（`renderer-bridge.js`）**：
+   - Phase 1 优先查找已挂载在后台隐藏 pane 中的目标会话编辑器（通过 `data-cascade-id` / `data-conversation-id` 或 React Fiber 精确校验 UUID），直接通过 `beforeinput` / `paste` 静默提交，**零界面切换**。
+   - Phase 2 当目标未挂载或隐藏态无法提交时，自动降级为瞬切目标会话提交并切回原会话（切回等待压缩至 `150ms`）。
+3. **草稿无损保护与 Lexical 三段式清空校验**：
+   - 仅在用户过去 `1.5s` 内有真实敲击键盘或输入法活动时短暂避让，不再因当前窗口的静止草稿拦截唤醒。
+   - `getEditorText()` 剥离零宽字符 `[\u200B-\u200D\uFEFF]`，防止 Lexical 空编辑器被误判为有草稿。
+   - 若目标会话输入框已有未发送草稿，采用 **暂存草稿 → 三段式清空（`selectAll` + `delete` / `Range` + `beforeinput` / `Ctrl+A` + `Backspace`）→ 严格校验为空 → 提交唤醒 → 恢复原草稿**；若清空未成功，直接中止提交并延后重试，绝不将唤醒文本拼接到用户草稿后一并发送。
+   - 全程不触碰目标会话的模型选择、推理强度与审核设置。
