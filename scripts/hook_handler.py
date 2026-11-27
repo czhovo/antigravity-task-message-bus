@@ -79,10 +79,11 @@ def handle_payload(payload: dict) -> dict:
                     "reason": text,
                 }
 
+        stop_status = "waiting_bg" if payload.get("fullyIdle") is False else "idle"
         bus_core.upsert_task_heartbeat(
             conv_id,
             source=source,
-            status="idle",
+            status=stop_status,
             cwd=cwd,
             workspace_paths=workspace_paths,
             model_name=model_name,

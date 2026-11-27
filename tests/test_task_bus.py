@@ -350,6 +350,108 @@ def main() -> None:
         hist_data = json.loads(r_hist["result"]["content"][0]["text"])
         assert hist_data["count"] == 6, hist_data
 
+        # 9. Stop with fullyIdle=False marks task as waiting_bg and suppresses wake-up
+        stop_bg = run_hook(
+            {
+                "conversationId": "cccccccc-1111-2222-3333-444444444444",
+                "hookEventName": "Stop",
+                "terminationReason": "NO_TOOL_CALL",
+                "fullyIdle": False,
+                "transcriptPath": "/tmp/mock/.gemini/antigravity/brain/ccc/transcript.jsonl",
+            },
+            env,
+        )
+        assert stop_bg == {}
+
+        r_bg = rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_task_message",
+                    "arguments": {
+                        "fromConversationId": "aaaaaaaa-1111-2222-3333-444444444444",
+                        "target": "cccccccc-1111-2222-3333-444444444444",
+                        "body": "后台等待中不应触发唤醒",
+                    },
+                },
+            }
+        )
+        bg_data = json.loads(r_bg["result"]["content"][0]["text"])
+        assert bg_data["delivery"]["mode"] == "hook_waiting_background", bg_data
+
+        # 10. Real-time transcript.jsonl inspection suppresses wake-up even if DB says idle
+        app_root = os.path.join(tmpdir, "mock_app_root")
+        cid_d = "dddddddd-1111-2222-3333-444444444444"
+        tp_dir = os.path.join(app_root, "brain", cid_d, ".system_generated", "logs")
+        os.makedirs(tp_dir, exist_ok=True)
+        tp_file = os.path.join(tp_dir, "transcript.jsonl")
+        with open(tp_file, "w", encoding="utf-8") as tf:
+            tf.write(json.dumps({"step_index": 0, "type": "USER_INPUT", "status": "DONE"}) + "\n")
+            tf.write(json.dumps({"step_index": 1, "type": "GENERIC", "status": "RUNNING"}) + "\n")
+            tf.write(json.dumps({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE"}) + "\n")
+
+        env_rt = env.copy()
+        env_rt["TASK_BUS_APP_ROOT"] = app_root
+        mcp2 = subprocess.Popen(
+            [sys.executable, MCP_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env_rt,
+        )
+
+        def rpc2(obj: dict):
+            mcp2.stdin.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+            mcp2.stdin.flush()
+            return json.loads(mcp2.stdout.readline().decode("utf-8"))
+
+        rpc2({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}})
+        r_rt = rpc2(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_task_message",
+                    "arguments": {
+                        "fromConversationId": "aaaaaaaa-1111-2222-3333-444444444444",
+                        "target": cid_d,
+                        "body": "transcript 有 RUNNING 步骤不应发唤醒",
+                    },
+                },
+            }
+        )
+        rt_data = json.loads(r_rt["result"]["content"][0]["text"])
+        assert rt_data["delivery"]["mode"] == "hook_waiting_background", rt_data
+        assert "active_steps=[1]" in str(rt_data["delivery"].get("runtimeCheck", {})), rt_data
+
+        # 11. Pending app wake file is auto-cancelled when hook delivers messages first
+        qdir = os.path.join(tmpdir, "app_wake_queue")
+        os.makedirs(qdir, exist_ok=True)
+        fake_wake_id = "9999999999999_deadbeef"
+        fake_wake_file = os.path.join(qdir, f"{fake_wake_id}.json")
+        with open(fake_wake_file, "w", encoding="utf-8") as wf:
+            json.dump({"wakeId": fake_wake_id, "targetConversationId": cid_d, "wakeText": "stale"}, wf)
+        pre_d = run_hook(
+            {
+                "conversationId": cid_d,
+                "hookEventName": "PreInvocation",
+                "transcriptPath": tp_file,
+            },
+            env_rt,
+        )
+        assert "injectSteps" in pre_d
+        assert not os.path.exists(fake_wake_file), "stale wake file should have been cancelled!"
+        cancel_res_path = os.path.join(tmpdir, "app_wake_results", f"{fake_wake_id}.json")
+        assert os.path.isfile(cancel_res_path)
+        with open(cancel_res_path, "r", encoding="utf-8") as cf:
+            cancel_res = json.load(cf)
+        assert cancel_res["reason"] == "cancelled_already_delivered_by_hook", cancel_res
+
+        mcp2.stdin.close()
+        mcp2.wait(timeout=5)
         mcp.stdin.close()
         mcp.wait(timeout=5)
         print("ALL_TESTS_PASSED")

@@ -47,14 +47,14 @@ def infer_unregistered_source(conversation_id: str) -> str:
     if not cid or any(ch in cid for ch in ("/", "\\", "..")):
         return "unknown"
     home = os.path.expanduser("~")
-    app_base = os.path.join(home, ".gemini", "antigravity")
+    app_base = os.environ.get("TASK_BUS_APP_ROOT") or os.path.join(home, ".gemini", "antigravity")
     if (
         os.path.isdir(os.path.join(app_base, "brain", cid))
         or os.path.isfile(os.path.join(app_base, "conversations", f"{cid}.pb"))
         or os.path.isfile(os.path.join(app_base, "conversations", f"{cid}.db"))
     ):
         return "app"
-    cli_base = os.path.join(home, ".gemini", "antigravity-cli")
+    cli_base = os.environ.get("TASK_BUS_CLI_ROOT") or os.path.join(home, ".gemini", "antigravity-cli")
     if (
         os.path.isdir(os.path.join(cli_base, "brain", cid))
         or os.path.isfile(os.path.join(cli_base, "conversations", f"{cid}.pb"))
@@ -62,6 +62,164 @@ def infer_unregistered_source(conversation_id: str) -> str:
     ):
         return "cli"
     return "unknown"
+
+
+def _get_session_base_dir(source: str) -> str | None:
+    src = (source or "").strip().lower()
+    home = os.path.expanduser("~")
+    if src == "app":
+        return os.environ.get("TASK_BUS_APP_ROOT") or os.path.join(home, ".gemini", "antigravity")
+    if src == "cli":
+        return os.environ.get("TASK_BUS_CLI_ROOT") or os.path.join(home, ".gemini", "antigravity-cli")
+    return None
+
+
+def inspect_target_runtime_state(conversation_id: str, source: str) -> dict[str, Any]:
+    """Inspect target session's transcript.jsonl and .db-wal to avoid redundant wake-ups
+    when the target is actively running or has pending background tasks / subagents / timers.
+    """
+    cid = (conversation_id or "").strip()
+    base = _get_session_base_dir(source)
+    if not cid or not base or any(ch in cid for ch in ("/", "\\", "..")):
+        return {"state": "unknown", "shouldWake": True, "reasons": []}
+
+    tp = os.path.join(base, "brain", cid, ".system_generated", "logs", "transcript.jsonl")
+    wal = os.path.join(base, "conversations", f"{cid}.db-wal")
+    if not os.path.isfile(tp):
+        return {"state": "unknown", "shouldWake": True, "reasons": []}
+
+    now = time.time()
+    try:
+        st = os.stat(tp)
+        tp_age = max(0.0, now - st.st_mtime)
+        wal_age = max(0.0, now - os.path.getmtime(wal)) if os.path.isfile(wal) else 999999.0
+        min_age = min(tp_age, wal_age)
+
+        read_size = min(st.st_size, 131072)
+        with open(tp, "rb") as f:
+            if st.st_size > read_size:
+                f.seek(st.st_size - read_size)
+            raw = f.read(read_size).decode("utf-8", errors="replace")
+
+        steps: list[dict[str, Any]] = []
+        for ln in raw.splitlines():
+            s = ln.strip()
+            if not s or not s.startswith("{"):
+                continue
+            try:
+                steps.append(json.loads(s))
+            except Exception:
+                continue
+
+        if not steps:
+            return {"state": "truly_idle", "shouldWake": True, "reasons": []}
+
+        last_closed_idx = -1
+        last_trigger_idx = -1
+        last_restart_idx = -1
+        for i, step in enumerate(steps):
+            t = step.get("type")
+            st_str = str(step.get("status") or "")
+            content = str(step.get("content") or "")
+            if t == "USER_INPUT":
+                last_trigger_idx = i
+            elif t == "PLANNER_RESPONSE":
+                tcs = step.get("tool_calls") or []
+                tc_names = {tc.get("name") for tc in tcs if isinstance(tc, dict)}
+                if tcs and "swarm_wait" not in tc_names:
+                    last_trigger_idx = i
+                elif st_str in ("DONE", "ERROR", "CANCELED"):
+                    last_closed_idx = i
+            elif t == "ERROR_MESSAGE":
+                last_closed_idx = i
+            elif t == "SYSTEM_MESSAGE" and "stopped due to server restart" in content:
+                last_restart_idx = i
+                prev_t = steps[i - 1].get("type") if i > 0 else None
+                if prev_t != "USER_INPUT":
+                    last_closed_idx = i
+
+        active_steps: list[Any] = []
+        for i, step in enumerate(steps):
+            if i <= last_restart_idx:
+                continue
+            if str(step.get("status") or "") not in ("RUNNING", "PENDING", "WAITING", "IN_PROGRESS"):
+                continue
+            has_later_sys = any(
+                steps[j].get("type") == "SYSTEM_MESSAGE"
+                for j in range(i + 1, len(steps))
+            )
+            if i > last_closed_idx or not has_later_sys:
+                active_steps.append(step.get("step_index", i))
+
+        reasons: list[str] = []
+        if active_steps and min_age < 7200:
+            reasons.append(f"active_steps={active_steps}")
+        if last_trigger_idx > last_closed_idx and min_age < 1800:
+            reasons.append(f"unclosed_turn(trigger={last_trigger_idx},closed={last_closed_idx})")
+        if wal_age < 5.0:
+            reasons.append(f"wal_recent({wal_age:.1f}s)")
+
+        if active_steps and min_age < 7200:
+            return {"state": "waiting_bg", "shouldWake": False, "reasons": reasons}
+        if (last_trigger_idx > last_closed_idx and min_age < 1800) or wal_age < 5.0:
+            return {"state": "running", "shouldWake": False, "reasons": reasons}
+        return {"state": "truly_idle", "shouldWake": True, "reasons": []}
+    except Exception as exc:
+        log_error("inspect_target_runtime_state", exc)
+        return {"state": "unknown", "shouldWake": True, "reasons": []}
+
+
+def _cancel_pending_app_wakes(conversation_id: str, *, via_event: str) -> int:
+    """Remove any unconsumed app_wake_queue files for a target whose messages were already delivered by hooks."""
+    cid_lower = (conversation_id or "").strip().lower()
+    if not cid_lower:
+        return 0
+    queue_dir = os.path.join(get_data_dir(), "app_wake_queue")
+    if not os.path.isdir(queue_dir):
+        return 0
+    results_dir = get_app_wake_results_dir()
+    cancelled = 0
+    try:
+        for fname in os.listdir(queue_dir):
+            if not fname.endswith(".json") or fname.startswith("."):
+                continue
+            fpath = os.path.join(queue_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception:
+                continue
+            target_id = str(payload.get("targetConversationId") or "").strip().lower()
+            if target_id != cid_lower:
+                continue
+            wake_id = str(payload.get("wakeId") or "")
+            try:
+                os.remove(fpath)
+                cancelled += 1
+            except FileNotFoundError:
+                continue
+            except Exception:
+                continue
+            if wake_id:
+                try:
+                    res = {
+                        "wakeId": wake_id,
+                        "finishedAt": utc_now_iso(),
+                        "ok": True,
+                        "reason": "cancelled_already_delivered_by_hook",
+                        "deliveredViaEvent": via_event,
+                        "targetConversationId": conversation_id,
+                    }
+                    tmp_r = os.path.join(results_dir, f".{wake_id}.tmp")
+                    fin_r = os.path.join(results_dir, f"{wake_id}.json")
+                    with open(tmp_r, "w", encoding="utf-8") as rf:
+                        json.dump(res, rf, ensure_ascii=False, indent=2)
+                    os.replace(tmp_r, fin_r)
+                except Exception:
+                    pass
+    except Exception as exc:
+        log_error("cancel_pending_app_wakes", exc)
+    return cancelled
 
 
 def get_error_log_path() -> str:
@@ -678,11 +836,22 @@ def send_message(
             else:
                 eff_status = target_row_dict["status"]
                 src = target_row_dict["source"]
-                if eff_status == "running":
+                runtime_check = inspect_target_runtime_state(target_value, src) if src in ("app", "cli") else {"state": "unknown", "shouldWake": True, "reasons": []}
+                if eff_status == "running" or runtime_check["state"] == "running":
                     wake_action = {
                         "attempted": False,
                         "mode": "hook_live_running",
-                        "note": "目标任务正在运行中，将在下一次 PreInvocation / PostInvocation / Stop 钩子自动实时注入。",
+                        "runtimeCheck": runtime_check,
+                        "note": "目标任务正在运行中，无需发送唤醒消息，将在下一次 PreInvocation / PostInvocation / Stop 钩子自动实时注入。",
+                    }
+                elif runtime_check["state"] == "waiting_bg" or (
+                    eff_status == "waiting_bg" and runtime_check["state"] != "truly_idle"
+                ):
+                    wake_action = {
+                        "attempted": False,
+                        "mode": "hook_waiting_background",
+                        "runtimeCheck": runtime_check,
+                        "note": "目标任务存在持续运行的后台任务/外部任务/子代理/定时等待，跳过唤醒以免阻塞对方消息队列；消息已入队，将在下次钩子触发时自动注入。",
                     }
                 elif src == "cli" and auto_wake:
                     last_wake_at = float(target_row["last_wake_at"] or 0.0)
@@ -880,6 +1049,9 @@ def pull_pending_messages(
 
         conn.execute("COMMIT")
 
+    if mark_delivered and collected:
+        _cancel_pending_app_wakes(conversation_id, via_event=via_event)
+
     return collected
 
 
@@ -1032,8 +1204,9 @@ def wake_task(
         target_dict = _task_row_to_dict(target_row)
         src = target_dict["source"]
         eff_status = target_dict["status"]
+        runtime_check = inspect_target_runtime_state(target_id, src) if (src in ("app", "cli") and not force) else {"state": "unknown", "shouldWake": True, "reasons": []}
 
-        if eff_status == "running" and not force:
+        if not force and (eff_status == "running" or runtime_check["state"] == "running"):
             conn.execute("COMMIT")
             return {
                 "ok": True,
@@ -1041,7 +1214,24 @@ def wake_task(
                 "delivery": {
                     "attempted": False,
                     "mode": "hook_live_running",
+                    "runtimeCheck": runtime_check,
                     "note": "目标任务正在运行中，无需重复唤醒。",
+                },
+            }
+
+        if not force and (
+            runtime_check["state"] == "waiting_bg"
+            or (eff_status == "waiting_bg" and runtime_check["state"] != "truly_idle")
+        ):
+            conn.execute("COMMIT")
+            return {
+                "ok": True,
+                "target": target_id,
+                "delivery": {
+                    "attempted": False,
+                    "mode": "hook_waiting_background",
+                    "runtimeCheck": runtime_check,
+                    "note": "目标任务存在持续运行的后台任务/外部任务/子代理/定时等待，跳过唤醒以免阻塞对方消息队列（如需强制唤醒请传 force=true）。",
                 },
             }
 
